@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""
+Jetson tegrastats-based profiler (CPU / GPU / RAM only).
+
+Features:
+- Runs tegrastats for a fixed duration (minimal overhead).
+- Shows lightweight progress bar.
+- Parses CPU (per-core util & freq), GPU (GR3D_FREQ), RAM.
+- Saves per-metric CSVs.
+- Generates a landscape-oriented PDF report:
+  * System info + table of contents
+  * CPU/GPU/RAM average metrics first
+  * Divider page
+  * Per-core CPU results (util + freq) side-by-side
+- If GPU activity is 0%, a special GPU page is still added.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import platform
+import re
+import statistics
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+
+# ---------------------------- Data structures ----------------------------
+
+@dataclass
+class MetricSeries:
+    name: str
+    unit: str
+    values: List[float]
+
+
+@dataclass
+class SystemInfo:
+    os_name: str
+    kernel_version: str
+    cpu_model: str
+    ram_total_gb: float
+    gpu_info: str
+    cuda_version: str | None
+    jetpack_version: str | None
+    deepstream_version: str | None
+
+
+# ---------------------------- Tegrastats runner ----------------------------
+
+def run_tegrastats(
+    duration_s: int,
+    log_path: Path,
+    interval_ms: int = 1000,
+) -> None:
+    """Run tegrastats for a fixed duration using minimal overhead."""
+    cmd = [
+        "tegrastats",
+        "--interval",
+        str(interval_ms),
+        "--logfile",
+        str(log_path),
+    ]
+
+    try:
+        proc = subprocess.Popen(cmd)
+    except FileNotFoundError:
+        raise SystemExit("Error: tegrastats not found in PATH.")
+
+    start = time.time()
+    end = start + duration_s
+    width = 40
+
+    try:
+        while True:
+            now = time.time()
+            elapsed = now - start
+            remaining = max(0.0, end - now)
+            progress = min(1.0, elapsed / duration_s)
+
+            filled = int(progress * width)
+            bar = "#" * filled + "-" * (width - filled)
+
+            print(
+                f"\r[{bar}] elapsed: {int(elapsed):4d}s  remaining: {int(remaining):4d}s",
+                end="",
+                flush=True,
+            )
+
+            if now >= end:
+                break
+            time.sleep(0.5)
+
+    finally:
+        print()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# ---------------------------- Log parsing ----------------------------
+
+RAM_RE = re.compile(r"RAM\s+(\d+)/(\d+)MB")
+CPU_RE = re.compile(r"CPU\s+\[([^\]]+)\]")
+GR3D_RE = re.compile(r"GR3D_FREQ\s+(\d+)%")
+
+
+def _append(metrics: Dict[str, MetricSeries], name: str, unit: str, value: float):
+    if name not in metrics:
+        metrics[name] = MetricSeries(name=name, unit=unit, values=[])
+    metrics[name].values.append(value)
+
+
+def parse_tegrastats_log(
+    log_path: Path,
+) -> Tuple[List[datetime], Dict[str, MetricSeries]]:
+    """Parse tegrastats log extracting CPU/GPU/RAM only."""
+    timestamps: List[datetime] = []
+    metrics: Dict[str, MetricSeries] = {}
+
+    with log_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                ts_str = line[:19]
+                ts = datetime.strptime(ts_str, "%m-%d-%Y %H:%M:%S")
+                rest = line[20:].strip()
+                timestamps.append(ts)
+            except Exception:
+                continue
+
+            # RAM
+            ram = RAM_RE.search(rest)
+            if ram:
+                used = float(ram.group(1))
+                total = float(ram.group(2))
+                _append(metrics, "ram_used_mb", "MB", used)
+                _append(metrics, "ram_total_mb", "MB", total)
+                _append(metrics, "ram_used_percent", "%", used * 100.0 / total)
+
+            # GPU (GR3D_FREQ)
+            gr3d = GR3D_RE.search(rest)
+            if gr3d:
+                _append(metrics, "gpu_gr3d_freq_percent", "%", float(gr3d.group(1)))
+
+            # CPU
+            cpu_match = CPU_RE.search(rest)
+            if cpu_match:
+                cores = cpu_match.group(1).split(",")
+                utils: List[float] = []
+                freqs: List[float] = []
+
+                for i, entry in enumerate(cores):
+                    m = re.match(r"(\d+)%@(\d+)", entry.strip())
+                    if not m:
+                        continue
+                    util = float(m.group(1))
+                    freq = float(m.group(2))
+                    utils.append(util)
+                    freqs.append(freq)
+
+                    _append(metrics, f"cpu_core_{i}_util_percent", "%", util)
+                    _append(metrics, f"cpu_core_{i}_freq_mhz", "MHz", freq)
+
+                if utils:
+                    _append(metrics, "cpu_avg_util_percent", "%", sum(utils) / len(utils))
+                if freqs:
+                    _append(metrics, "cpu_avg_freq_mhz", "MHz", sum(freqs) / len(freqs))
+
+    return timestamps, metrics
+
+
+# ---------------------------- CSV writing ----------------------------
+
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", name)
+
+
+def write_metric_csvs(
+    base: str,
+    timestamps: List[datetime],
+    metrics: Dict[str, MetricSeries],
+    out: Path,
+) -> List[Path]:
+    """Write one CSV per metric."""
+    if not timestamps:
+        return []
+
+    out.mkdir(parents=True, exist_ok=True)
+    t0 = timestamps[0]
+    elapsed = [(ts - t0).total_seconds() for ts in timestamps]
+
+    paths: List[Path] = []
+
+    for series in metrics.values():
+        if len(series.values) != len(timestamps):
+            continue
+
+        p = out / f"{base}_{_safe(series.name)}.csv"
+        paths.append(p)
+
+        with p.open("w") as f:
+            f.write("timestamp,elapsed_seconds,value\n")
+            for ts, es, v in zip(timestamps, elapsed, series.values):
+                f.write(f"{ts.isoformat()},{es:.3f},{v:.6f}\n")
+
+    return paths
+
+
+# ---------------------------- System info ----------------------------
+
+def _read_os():
+    p = Path("/etc/os-release")
+    if p.exists():
+        for line in p.read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip().strip('"')
+    return platform.platform()
+
+
+def _read_ram_gb():
+    p = Path("/proc/meminfo")
+    if not p.exists():
+        return 0.0
+    for line in p.read_text().splitlines():
+        if line.startswith("MemTotal:"):
+            kb = float(line.split()[1])
+            return kb / (1024**2)
+    return 0.0
+
+
+def _read_cuda():
+    try:
+        out = subprocess.check_output(
+            ["nvcc", "--version"], encoding="utf-8", stderr=subprocess.STDOUT
+        )
+        m = re.search(r"release\s+([0-9.]+)", out)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _read_jetpack():
+    p = Path("/etc/nv_tegra_release")
+    if not p.exists():
+        return None
+    first = p.read_text().splitlines()[0]
+    m = re.search(r"R(\d+)", first)
+    return f"R{m.group(1)}" if m else first
+
+
+def _read_deepstream():
+    try:
+        out = subprocess.check_output(
+            ["deepstream-app", "--version-all"],
+            encoding="utf-8",
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+        m = re.search(r"DeepStream SDK\s*([0-9.]+)", out)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def gather_system_info() -> SystemInfo:
+    return SystemInfo(
+        os_name=_read_os(),
+        kernel_version=platform.release(),
+        cpu_model=platform.processor() or "Unknown CPU",
+        ram_total_gb=_read_ram_gb(),
+        gpu_info="Jetson integrated GPU (GR3D)",
+        cuda_version=_read_cuda(),
+        jetpack_version=_read_jetpack(),
+        deepstream_version=_read_deepstream(),
+    )
+
+
+# ---------------------------- PDF generation ----------------------------
+
+def generate_pdf(
+    pdf_path: Path,
+    timestamps: List[datetime],
+    metrics: Dict[str, MetricSeries],
+    system: SystemInfo,
+) -> None:
+    """Generate PDF report (landscape pages)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    t0 = timestamps[0]
+    time_s = [(ts - t0).total_seconds() for ts in timestamps]
+
+    # Metrics of interest (specific order)
+    avg_order = [
+        "cpu_avg_util_percent",
+        "cpu_avg_freq_mhz",
+        "ram_used_percent",
+        "ram_used_mb",
+        "gpu_gr3d_freq_percent",
+    ]
+
+    # Identify per-core metrics
+    core_pairs: List[Tuple[MetricSeries, MetricSeries]] = []
+    for series in metrics.values():
+        if series.name.startswith("cpu_core_") and series.name.endswith("_util_percent"):
+            idx = int(series.name.split("_")[2])
+            util_series = series
+            freq_series = metrics.get(f"cpu_core_{idx}_freq_mhz")
+            if freq_series:
+                core_pairs.append((util_series, freq_series))
+
+    # TOC entries built in order they will appear
+    toc_entries: List[Tuple[str, int]] = []
+    page_counter = 2  # Page 1 is system info + toc
+
+    with PdfPages(pdf_path) as pdf:
+
+        # ---- PAGE 1: System info + TOC ----
+        fig = plt.figure(figsize=(11.69, 8.27))  # Landscape A4
+        ax = fig.add_subplot(111)
+        ax.axis("off")
+
+        sys_lines = [
+            "Jetson Performance Report",
+            "",
+            f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+            "",
+            "System Information:",
+            f"  OS: {system.os_name}",
+            f"  Kernel: {system.kernel_version}",
+            f"  CPU: {system.cpu_model}",
+            f"  RAM: {system.ram_total_gb:.2f} GB",
+            f"  GPU: {system.gpu_info}",
+            f"  CUDA: {system.cuda_version or 'not detected'}",
+            f"  JetPack: {system.jetpack_version or 'not detected'}",
+            f"  DeepStream: {system.deepstream_version or 'not detected'}",
+            "",
+            "Table of Contents:",
+            "",
+        ]
+
+        # Render system info + placeholder for TOC
+        ax.text(0.02, 0.98, "\n".join(sys_lines), va="top", ha="left", fontsize=10)
+
+        # Now compute TOC entries
+        toc_list = []
+
+        # First averages
+        for name in avg_order:
+            if name not in metrics:
+                continue
+            pretty = name.replace("_", " ").capitalize()
+            toc_list.append((pretty, page_counter))
+            page_counter += 1
+
+        page_counter += 1
+
+        # Per-core pages
+        for util, freq in core_pairs:
+            idx = util.name.split("_")[2]
+            name = f"CPU Core {idx} (Util + Freq)"
+            toc_list.append((name, page_counter))
+            page_counter += 1
+
+        # Render TOC below system info
+        y = 0.60
+        for title, page in toc_list:
+            line = f"{title} {'.' * (60 - len(title))} {page}"
+            ax.text(0.04, y, line, va="top", ha="left", fontsize=9)
+            y -= 0.03
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # ---- AVERAGE METRIC PAGES ----
+        for name in avg_order:
+            series = metrics.get(name)
+            if not series:
+                continue
+
+            fig = plt.figure(figsize=(11.69, 8.27))
+            ax = fig.add_subplot(111)
+
+            if name == "gpu_gr3d_freq_percent" and max(series.values) == 0:
+                # Special GPU page: no activity
+                ax.axis("off")
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No GPU activity detected\n(GR3D_FREQ remained 0% during the test)",
+                    ha="center",
+                    va="center",
+                    fontsize=16,
+                )
+                pdf.savefig(fig)
+                plt.close(fig)
+                continue
+
+            ax.plot(time_s, series.values, linewidth=1.0)
+            ax.set_title(series.name)
+            ax.set_xlabel("Time [s]")
+            ax.set_ylabel(series.unit)
+
+            v = series.values
+            stats_text = (
+                f"count: {len(v)}\n"
+                f"min: {min(v):.3f}\n"
+                f"mean: {statistics.fmean(v):.3f}\n"
+                f"median: {statistics.median(v):.3f}\n"
+                f"max: {max(v):.3f}"
+            )
+            ax.text(
+                0.98,
+                0.98,
+                stats_text,
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                bbox=dict(boxstyle="round", alpha=0.2),
+            )
+
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        # ---- DIVIDER PAGE ----
+        fig = plt.figure(figsize=(11.69, 8.27))
+        ax = fig.add_subplot(111)
+        ax.axis("off")
+        ax.text(
+            0.5,
+            0.5,
+            "SPECIFIC CPU CORE RESULTS",
+            ha="center",
+            va="center",
+            fontsize=18,
+        )
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # ---- PER-CORE PAGES ----
+        for util_series, freq_series in core_pairs:
+            fig = plt.figure(figsize=(11.69, 8.27))
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
+
+            # UTIL PLOT
+            ax1.plot(time_s, util_series.values, linewidth=1.0)
+            ax1.set_title(util_series.name)
+            ax1.set_xlabel("Time [s]")
+            ax1.set_ylabel(util_series.unit)
+
+            v = util_series.values
+            ax1.text(
+                0.98,
+                0.98,
+                f"min: {min(v):.3f}\nmean: {statistics.fmean(v):.3f}\nmedian: {statistics.median(v):.3f}\nmax: {max(v):.3f}",
+                transform=ax1.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                bbox=dict(boxstyle="round", alpha=0.2),
+            )
+
+            # FREQ PLOT
+            ax2.plot(time_s, freq_series.values, linewidth=1.0)
+            ax2.set_title(freq_series.name)
+            ax2.set_xlabel("Time [s]")
+            ax2.set_ylabel(freq_series.unit)
+
+            v = freq_series.values
+            ax2.text(
+                0.98,
+                0.98,
+                f"min: {min(v):.3f}\nmean: {statistics.fmean(v):.3f}\nmedian: {statistics.median(v):.3f}\nmax: {max(v):.3f}",
+                transform=ax2.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                bbox=dict(boxstyle="round", alpha=0.2),
+            )
+
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+# ---------------------------- Helpers ----------------------------
+
+def remove_files(paths: List[Path]):
+    for p in paths:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+# ---------------------------- CLI ----------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Run tegrastats and generate a CPU/GPU/RAM PDF report."
+    )
+    p.add_argument("duration", type=int, help="Duration in seconds.")
+    p.add_argument("--interval-ms", type=int, default=1000)
+    p.add_argument("--keep-intermediate", action="store_true")
+    p.add_argument("--output-dir", default=".")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    duration = max(args.duration, 1)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"tegrastats_{timestamp}_dur{duration}s"
+
+    out = Path(args.output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    log_path = out / f"{base}.log"
+    pdf_path = out / f"{base}.pdf"
+
+    print(f"Running tegrastats for {duration}s...")
+    run_tegrastats(duration, log_path, args.interval_ms)
+
+    print("Parsing log...")
+    timestamps, metrics = parse_tegrastats_log(log_path)
+
+    print("Writing CSV files...")
+    csv_paths = write_metric_csvs(base, timestamps, metrics, out)
+
+    print("Gathering system info...")
+    system = gather_system_info()
+
+    print("Generating PDF report...")
+    generate_pdf(pdf_path, timestamps, metrics, system)
+
+    if not args.keep_intermediate:
+        print("Removing intermediate files...")
+        remove_files([log_path] + csv_paths)
+
+    print("Done.")
+    print(f"PDF saved to: {pdf_path}")
+
+
+if __name__ == "__main__":
+    main()
+
