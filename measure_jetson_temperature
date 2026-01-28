@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""
+Jetson tegrastats temperature monitor (live ANSI bars + PDF + DOT + final TXT summary).
+
+Adds:
+- Final summary includes total runtime (wall time of the measurement loop).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+
+TEMP_TOKEN_RE = re.compile(r"(?P<name>[A-Za-z0-9_]+)@(?P<temp>[0-9]+(?:\.[0-9]+)?)C")
+TS_RE = re.compile(r"(?P<ts>\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}:\d{2})")
+
+
+@dataclass(frozen=True)
+class Sample:
+    t_sec: float
+    timestamp: dt.datetime
+    temps: Dict[str, float]
+
+
+class KeyReader:
+    """Non-blocking single-key reader for Linux terminals. Works only if stdin is a TTY."""
+    def __init__(self) -> None:
+        self._enabled = sys.stdin.isatty()
+        self._old_settings = None
+
+    def __enter__(self) -> "KeyReader":
+        if not self._enabled:
+            return self
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        self._old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not self._enabled:
+            return
+        import termios
+        fd = sys.stdin.fileno()
+        if self._old_settings is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, self._old_settings)
+
+    def read_key(self) -> Optional[str]:
+        if not self._enabled:
+            return None
+        import select
+        r, _, _ = select.select([sys.stdin], [], [], 0.0)
+        if not r:
+            return None
+        return sys.stdin.read(1)
+
+
+def parse_timestamp(line: str) -> dt.datetime:
+    m = TS_RE.search(line)
+    if not m:
+        return dt.datetime.now()
+    try:
+        return dt.datetime.strptime(m.group("ts"), "%m-%d-%Y %H:%M:%S")
+    except ValueError:
+        return dt.datetime.now()
+
+
+def parse_temps(line: str) -> Dict[str, float]:
+    temps: Dict[str, float] = {}
+    for m in TEMP_TOKEN_RE.finditer(line):
+        temps[m.group("name")] = float(m.group("temp"))
+    return temps
+
+
+def terminal_size() -> Tuple[int, int]:
+    try:
+        import shutil
+        s = shutil.get_terminal_size(fallback=(120, 30))
+        return s.columns, s.lines
+    except Exception:
+        return 120, 30
+
+
+def clear_screen() -> None:
+    sys.stdout.write("\x1b[2J\x1b[H")
+
+
+def render_bars(latest: Dict[str, float], max_seen: Dict[str, float], headline: str, status: str) -> None:
+    cols, _ = terminal_size()
+    left_width = 18
+    temp_width = 8
+    bar_space = max(10, cols - left_width - temp_width - 10)
+
+    clear_screen()
+    sys.stdout.write(headline + "\n")
+    sys.stdout.write(status + "\n")
+    sys.stdout.write("-" * min(cols, 120) + "\n")
+
+    if not latest:
+        sys.stdout.write("No temperature tokens detected yet (waiting for lines containing 'sensor@XXC').\n")
+        sys.stdout.flush()
+        return
+
+    for name in sorted(latest.keys()):
+        val = latest[name]
+        mval = max_seen.get(name, val)
+        scale_max = max(80.0, mval)
+        fill = int((val / scale_max) * bar_space)
+        fill = max(0, min(bar_space, fill))
+        bar = "█" * fill + " " * (bar_space - fill)
+        sys.stdout.write(f"{name:<{left_width}} {val:>6.2f}C |{bar}|\n")
+
+    sys.stdout.write("\nPress 'q' to stop (if enabled). Ctrl+C always works.\n")
+    sys.stdout.flush()
+
+
+def write_long_csv(csv_path: Path, sample: Sample) -> None:
+    is_new = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(["t_sec", "iso_time", "sensor", "temp_c"])
+        for sensor, temp in sample.temps.items():
+            w.writerow([f"{sample.t_sec:.3f}", sample.timestamp.isoformat(), sensor, f"{temp:.3f}"])
+
+
+def build_series(samples: List[Sample]) -> Dict[str, Tuple[List[float], List[float]]]:
+    series: Dict[str, Tuple[List[float], List[float]]] = {}
+    for s in samples:
+        for sensor, temp in s.temps.items():
+            if sensor not in series:
+                series[sensor] = ([], [])
+            xs, ys = series[sensor]
+            xs.append(s.t_sec)
+            ys.append(temp)
+    return series
+
+
+def save_pdf(pdf_path: Path, series: Dict[str, Tuple[List[float], List[float]]], title: str) -> None:
+    plt.figure()
+    for sensor in sorted(series.keys()):
+        xs, ys = series[sensor]
+        if xs:
+            plt.plot(xs, ys, label=sensor)
+    plt.xlabel("Time (s)")
+    plt.ylabel("Temperature (C)")
+    plt.title(title)
+    plt.grid(True)
+    plt.legend(ncol=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(pdf_path, format="pdf")
+    plt.close()
+
+
+def save_dot(dot_path: Path, series: Dict[str, Tuple[List[float], List[float]]], title: str) -> None:
+    all_x: List[float] = []
+    all_y: List[float] = []
+    for xs, ys in series.values():
+        all_x.extend(xs)
+        all_y.extend(ys)
+
+    if not all_x or not all_y:
+        dot_path.write_text('graph G { label="No data"; }\n', encoding="utf-8")
+        return
+
+    min_x, max_x = min(all_x), max(all_x)
+    min_y, max_y = min(all_y), max(all_y)
+    if max_x <= min_x:
+        max_x = min_x + 1.0
+    if max_y <= min_y:
+        max_y = min_y + 1.0
+
+    width = 1200.0
+    height = 700.0
+    pad = 50.0
+
+    def sx(x: float) -> float:
+        return pad + (x - min_x) / (max_x - min_x) * (width - 2 * pad)
+
+    def sy(y: float) -> float:
+        return pad + (y - min_y) / (max_y - min_y) * (height - 2 * pad)
+
+    lines: List[str] = []
+    lines.append("graph Temps {")
+    lines.append('  graph [splines=true, overlap=false, dpi=120];')
+    lines.append('  node [shape=point, width=0.03, height=0.03, label=""];')
+    lines.append(f'  label="{title}"; labelloc=top; fontsize=18;')
+    lines.append("  // Render with: neato -Tpdf output.dot -o output.pdf")
+    lines.append("")
+
+    for sensor_idx, sensor in enumerate(sorted(series.keys())):
+        xs, ys = series[sensor]
+        if len(xs) < 2:
+            continue
+        prev_node = None
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            node_id = f"n_{sensor_idx}_{i}"
+            lines.append(f'  {node_id} [pos="{sx(x):.2f},{sy(y):.2f}!", tooltip="{sensor} {y:.2f}C @ {x:.2f}s"];')
+            if prev_node is not None:
+                lines.append(f"  {prev_node} -- {node_id};")
+            prev_node = node_id
+
+        lx = width - pad
+        ly = height - pad - (sensor_idx * 16.0)
+        leg_id = f"legend_{sensor_idx}"
+        lines.append(f'  {leg_id} [shape=plaintext, label="{sensor}", pos="{lx:.2f},{ly:.2f}!", fontsize=10];')
+        lines.append("")
+
+    lines.append("}")
+    dot_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def detect_interval_args(cmd: str, interval_ms: int) -> List[str]:
+    try:
+        help_out = subprocess.check_output([cmd, "--help"], text=True, stderr=subprocess.STDOUT)
+    except Exception:
+        help_out = ""
+
+    if "--interval" in help_out:
+        return [cmd, "--interval", str(interval_ms)]
+    if re.search(r"(^|\s)-i(\s|$)", help_out):
+        return [cmd, "-i", str(interval_ms)]
+    return [cmd, "--interval", str(interval_ms)]
+
+
+def spawn_tegrastats(cmd: str, interval_ms: int) -> subprocess.Popen:
+    args = detect_interval_args(cmd, interval_ms)
+    return subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+
+def format_final_summary(last_line: str, last_temps: Dict[str, float], total_runtime_sec: float) -> str:
+    timestamp = parse_timestamp(last_line) if last_line else dt.datetime.now()
+    lines: List[str] = []
+    lines.append("Measurement summary")
+    lines.append(f"Total runtime: {total_runtime_sec:.3f} seconds")
+    lines.append("")
+    lines.append("Final temperatures from last tegrastats line containing temperature tokens")
+    lines.append(f"Timestamp: {timestamp.isoformat(sep=' ')}")
+    lines.append("")
+    for name in sorted(last_temps.keys()):
+        lines.append(f"{name}: {last_temps[name]:.2f} C")
+    lines.append("")
+    lines.append("Raw line:")
+    lines.append(last_line if last_line else "<no line available>")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--stdin", action="store_true", help="Read tegrastats lines from stdin instead of spawning tegrastats.")
+    ap.add_argument("--tegrastats-cmd", default="tegrastats", help="Path/name of tegrastats executable.")
+    ap.add_argument("--interval-ms", type=int, default=1000, help="Sampling interval in ms (when spawning tegrastats).")
+
+    ap.add_argument("--duration", type=float, default=None, help="Stop after N seconds.")
+    ap.add_argument("--until-q", action="store_true", help="Stop when 'q' is pressed (TTY only). Default if no mode selected.")
+    ap.add_argument("--stable-sensor", type=str, default=None, help="Enable stability stop mode for this sensor (e.g., tj).")
+    ap.add_argument("--stable-seconds", type=float, default=60.0, help="Seconds without exceeding max to stop (stability mode).")
+
+    ap.add_argument("--output-dir", type=str, default=".", help="Directory for outputs.")
+    ap.add_argument("--output-prefix", type=str, default=None, help="Prefix for output files (default: tegrastats_<timestamp>).")
+    ap.add_argument("--keep", action="store_true", help="Keep raw measurement files (CSV + RAW log).")
+    args = ap.parse_args()
+
+    stop_by_q = args.until_q
+    stop_by_duration = args.duration is not None
+    stop_by_stability = args.stable_sensor is not None
+    if not (stop_by_q or stop_by_duration or stop_by_stability):
+        stop_by_q = True
+
+    stable_sensor = args.stable_sensor or "tj"
+    stable_seconds = float(args.stable_seconds)
+
+    out_dir = Path(args.output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    prefix = args.output_prefix or ("tegrastats_" + dt.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    pdf_path = out_dir / f"{prefix}.pdf"
+    dot_path = out_dir / f"{prefix}.dot"
+    txt_path = out_dir / f"{prefix}.txt"
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"{prefix}_"))
+    csv_path = tmp_dir / f"{prefix}.csv"
+    raw_log_path = tmp_dir / f"{prefix}.raw.log"
+
+    samples: List[Sample] = []
+    max_seen: Dict[str, float] = {}
+    latest: Dict[str, float] = {}
+
+    last_temp_line: str = ""
+    last_temp_dict: Dict[str, float] = {}
+
+    start_monotonic = time.monotonic()
+    last_exceed_time = start_monotonic
+    stable_max: Optional[float] = None
+
+    stop_requested = False
+
+    def request_stop(signum=None, frame=None) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
+    proc: Optional[subprocess.Popen] = None
+    line_iter = None
+
+    consecutive_no_temp = 0
+    last_non_temp_line: str = ""
+
+    try:
+        if args.stdin:
+            line_iter = sys.stdin
+        else:
+            try:
+                proc = spawn_tegrastats(args.tegrastats_cmd, args.interval_ms)
+            except FileNotFoundError:
+                print(f"ERROR: tegrastats command not found: {args.tegrastats_cmd}", file=sys.stderr)
+                return 2
+            assert proc.stdout is not None
+            line_iter = proc.stdout
+
+        with KeyReader() as kr, raw_log_path.open("w", encoding="utf-8") as rawlog:
+            while not stop_requested:
+                if proc is not None and proc.poll() is not None:
+                    stop_requested = True
+
+                line = next(line_iter, None)
+                if line is None:
+                    break
+
+                line = line.rstrip("\n")
+                rawlog.write(line + "\n")
+                rawlog.flush()
+
+                temps = parse_temps(line)
+                if not temps:
+                    consecutive_no_temp += 1
+                    last_non_temp_line = line
+                else:
+                    consecutive_no_temp = 0
+
+                    last_temp_line = line
+                    last_temp_dict = temps
+
+                    now_ts = parse_timestamp(line)
+                    t_sec = time.monotonic() - start_monotonic
+
+                    latest = temps
+                    for k, v in temps.items():
+                        max_seen[k] = max(max_seen.get(k, v), v)
+
+                    samples.append(Sample(t_sec=t_sec, timestamp=now_ts, temps=temps))
+                    write_long_csv(csv_path, samples[-1])
+
+                    if stop_by_stability and stable_sensor in temps:
+                        cur = temps[stable_sensor]
+                        if stable_max is None or cur > stable_max:
+                            stable_max = cur
+                            last_exceed_time = time.monotonic()
+                        else:
+                            stable_for = time.monotonic() - last_exceed_time
+                            if stable_for >= stable_seconds:
+                                stop_requested = True
+
+                elapsed_total = time.monotonic() - start_monotonic
+                if stop_by_duration and args.duration is not None and elapsed_total >= float(args.duration):
+                    stop_requested = True
+
+                headline_parts = [f"Output: {prefix}"]
+                if stop_by_stability:
+                    stable_for = time.monotonic() - last_exceed_time
+                    if stable_max is None:
+                        headline_parts.append(f"Stability: sensor={stable_sensor} (waiting for first reading)")
+                    else:
+                        headline_parts.append(
+                            f"Stability: sensor={stable_sensor} max={stable_max:.2f}C stable_for={stable_for:.1f}/{stable_seconds:.1f}s"
+                        )
+                if stop_by_duration and args.duration is not None:
+                    headline_parts.append(f"Duration: {elapsed_total:.1f}/{float(args.duration):.1f}s")
+                headline = " | ".join(headline_parts)
+
+                status = "OK"
+                if consecutive_no_temp > 0:
+                    status = f"WARNING: No temp tokens for {consecutive_no_temp} line(s). Last line: {last_non_temp_line[:140]}"
+
+                render_bars(latest=latest, max_seen=max_seen, headline=headline, status=status)
+
+                if stop_by_q:
+                    ch = kr.read_key()
+                    if ch is not None and ch.lower() == "q":
+                        stop_requested = True
+
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    total_runtime_sec = time.monotonic() - start_monotonic
+
+    if not samples:
+        clear_screen()
+        print("ERROR: No temperature samples collected.")
+        print(f"Raw log saved at: {raw_log_path}")
+        if proc is not None:
+            print(f"tegrastats return code: {proc.returncode}")
+        print("Tip: Run manually to verify tegrastats output, e.g.:")
+        print(f"  {args.tegrastats_cmd} --interval {args.interval_ms}")
+        fail_log = out_dir / f"{prefix}.raw.log"
+        try:
+            fail_log.write_text(raw_log_path.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"Copied raw log to: {fail_log}")
+        except Exception:
+            pass
+        return 3
+
+    series = build_series(samples)
+    title = f"Tegrastats Temperatures ({prefix})"
+    save_pdf(pdf_path, series, title=title)
+    save_dot(dot_path, series, title=title)
+
+    final_summary = format_final_summary(last_temp_line, last_temp_dict, total_runtime_sec)
+    clear_screen()
+    print(final_summary)
+    txt_path.write_text(final_summary, encoding="utf-8")
+
+    if args.keep:
+        try:
+            (out_dir / f"{prefix}.csv").write_bytes(csv_path.read_bytes())
+        except Exception:
+            pass
+        try:
+            (out_dir / f"{prefix}.raw.log").write_text(raw_log_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
+
+    try:
+        for p in tmp_dir.glob("*"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        try:
+            tmp_dir.rmdir()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    print(f"Saved PDF: {pdf_path}")
+    print(f"Saved DOT: {dot_path}")
+    print(f"Saved TXT: {txt_path}")
+    if args.keep:
+        print(f"Saved CSV: {out_dir / (prefix + '.csv')}")
+        print(f"Saved RAW: {out_dir / (prefix + '.raw.log')}")
+    print("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
