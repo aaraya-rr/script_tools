@@ -2,8 +2,10 @@
 """
 Jetson tegrastats temperature monitor (live ANSI bars + PDF + DOT + final TXT summary).
 
-Adds:
-- Final summary includes total runtime (wall time of the measurement loop).
+Additions:
+- Displays and records Jetson power mode (nvpmodel).
+- Stability mode uses a delta threshold: timer resets only if temp exceeds (max + delta).
+- Final TXT includes: total runtime, power mode, final temperatures, maximum temperatures.
 """
 
 from __future__ import annotations
@@ -101,7 +103,36 @@ def clear_screen() -> None:
     sys.stdout.write("\x1b[2J\x1b[H")
 
 
-def render_bars(latest: Dict[str, float], max_seen: Dict[str, float], headline: str, status: str) -> None:
+def get_power_mode() -> Tuple[str, str]:
+    """
+    Returns:
+      (mode_short, raw_output)
+    Tries nvpmodel -q (available on most Jetson setups).
+    """
+    try:
+        out = subprocess.check_output(["nvpmodel", "-q"], text=True, stderr=subprocess.STDOUT).strip()
+    except Exception as e:
+        return ("UNKNOWN", f"nvpmodel not available or failed: {e}")
+
+    # Typical output includes "NV Power Mode: <...>"
+    mode = "UNKNOWN"
+    for line in out.splitlines():
+        if "NV Power Mode" in line:
+            # Example: "NV Power Mode: MODE_15W_6CORE"
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                mode = parts[1].strip()
+            break
+
+    return (mode, out)
+
+
+def render_bars(
+    latest: Dict[str, float],
+    max_seen: Dict[str, float],
+    headline: str,
+    status: str
+) -> None:
     cols, _ = terminal_size()
     left_width = 18
     temp_width = 8
@@ -251,19 +282,37 @@ def spawn_tegrastats(cmd: str, interval_ms: int) -> subprocess.Popen:
     )
 
 
-def format_final_summary(last_line: str, last_temps: Dict[str, float], total_runtime_sec: float) -> str:
+def format_final_summary(
+    last_line: str,
+    last_temps: Dict[str, float],
+    max_seen: Dict[str, float],
+    total_runtime_sec: float,
+    power_mode: str,
+    power_mode_raw: str,
+) -> str:
     timestamp = parse_timestamp(last_line) if last_line else dt.datetime.now()
     lines: List[str] = []
     lines.append("Measurement summary")
     lines.append(f"Total runtime: {total_runtime_sec:.3f} seconds")
+    lines.append(f"Power mode: {power_mode}")
     lines.append("")
     lines.append("Final temperatures from last tegrastats line containing temperature tokens")
     lines.append(f"Timestamp: {timestamp.isoformat(sep=' ')}")
     lines.append("")
     for name in sorted(last_temps.keys()):
         lines.append(f"{name}: {last_temps[name]:.2f} C")
+
     lines.append("")
-    lines.append("Raw line:")
+    lines.append("Maximum temperatures observed during the run")
+    for name in sorted(max_seen.keys()):
+        lines.append(f"{name}: {max_seen[name]:.2f} C")
+
+    lines.append("")
+    lines.append("nvpmodel raw output:")
+    lines.append(power_mode_raw)
+
+    lines.append("")
+    lines.append("Raw tegrastats line:")
     lines.append(last_line if last_line else "<no line available>")
     lines.append("")
     return "\n".join(lines)
@@ -279,6 +328,7 @@ def main() -> int:
     ap.add_argument("--until-q", action="store_true", help="Stop when 'q' is pressed (TTY only). Default if no mode selected.")
     ap.add_argument("--stable-sensor", type=str, default=None, help="Enable stability stop mode for this sensor (e.g., tj).")
     ap.add_argument("--stable-seconds", type=float, default=60.0, help="Seconds without exceeding max to stop (stability mode).")
+    ap.add_argument("--stable-delta", type=float, default=0.5, help="Delta (C) required above the last max to reset the timer (default: 0.5).")
 
     ap.add_argument("--output-dir", type=str, default=".", help="Directory for outputs.")
     ap.add_argument("--output-prefix", type=str, default=None, help="Prefix for output files (default: tegrastats_<timestamp>).")
@@ -293,6 +343,7 @@ def main() -> int:
 
     stable_sensor = args.stable_sensor or "tj"
     stable_seconds = float(args.stable_seconds)
+    stable_delta = float(args.stable_delta)
 
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -313,9 +364,16 @@ def main() -> int:
     last_temp_line: str = ""
     last_temp_dict: Dict[str, float] = {}
 
+    # Power mode caching
+    power_mode, power_mode_raw = get_power_mode()
+    last_power_check = time.monotonic()
+    power_check_period_sec = 2.0  # update display periodically without spamming
+
     start_monotonic = time.monotonic()
-    last_exceed_time = start_monotonic
-    stable_max: Optional[float] = None
+
+    # Stability tracking: timer resets only when temp exceeds (effective_max + stable_delta)
+    last_reset_time = start_monotonic
+    effective_max: Optional[float] = None
 
     stop_requested = False
 
@@ -357,6 +415,12 @@ def main() -> int:
                 rawlog.write(line + "\n")
                 rawlog.flush()
 
+                # Periodically refresh power mode for display
+                now_mono = time.monotonic()
+                if now_mono - last_power_check >= power_check_period_sec:
+                    power_mode, power_mode_raw = get_power_mode()
+                    last_power_check = now_mono
+
                 temps = parse_temps(line)
                 if not temps:
                     consecutive_no_temp += 1
@@ -379,26 +443,32 @@ def main() -> int:
 
                     if stop_by_stability and stable_sensor in temps:
                         cur = temps[stable_sensor]
-                        if stable_max is None or cur > stable_max:
-                            stable_max = cur
-                            last_exceed_time = time.monotonic()
+                        if effective_max is None:
+                            effective_max = cur
+                            last_reset_time = time.monotonic()
                         else:
-                            stable_for = time.monotonic() - last_exceed_time
-                            if stable_for >= stable_seconds:
-                                stop_requested = True
+                            # Reset only if we exceed (effective_max + stable_delta)
+                            if cur > (effective_max + stable_delta):
+                                effective_max = cur
+                                last_reset_time = time.monotonic()
+                            else:
+                                stable_for = time.monotonic() - last_reset_time
+                                if stable_for >= stable_seconds:
+                                    stop_requested = True
 
                 elapsed_total = time.monotonic() - start_monotonic
                 if stop_by_duration and args.duration is not None and elapsed_total >= float(args.duration):
                     stop_requested = True
 
-                headline_parts = [f"Output: {prefix}"]
+                headline_parts = [f"Output: {prefix}", f"Power mode: {power_mode}"]
                 if stop_by_stability:
-                    stable_for = time.monotonic() - last_exceed_time
-                    if stable_max is None:
+                    stable_for = time.monotonic() - last_reset_time
+                    if effective_max is None:
                         headline_parts.append(f"Stability: sensor={stable_sensor} (waiting for first reading)")
                     else:
                         headline_parts.append(
-                            f"Stability: sensor={stable_sensor} max={stable_max:.2f}C stable_for={stable_for:.1f}/{stable_seconds:.1f}s"
+                            f"Stability: sensor={stable_sensor} max={effective_max:.2f}C "
+                            f"delta={stable_delta:.2f}C stable_for={stable_for:.1f}/{stable_seconds:.1f}s"
                         )
                 if stop_by_duration and args.duration is not None:
                     headline_parts.append(f"Duration: {elapsed_total:.1f}/{float(args.duration):.1f}s")
@@ -445,7 +515,18 @@ def main() -> int:
     save_pdf(pdf_path, series, title=title)
     save_dot(dot_path, series, title=title)
 
-    final_summary = format_final_summary(last_temp_line, last_temp_dict, total_runtime_sec)
+    # Ensure power mode in summary is current at end
+    power_mode, power_mode_raw = get_power_mode()
+
+    final_summary = format_final_summary(
+        last_line=last_temp_line,
+        last_temps=last_temp_dict,
+        max_seen=max_seen,
+        total_runtime_sec=total_runtime_sec,
+        power_mode=power_mode,
+        power_mode_raw=power_mode_raw,
+    )
+
     clear_screen()
     print(final_summary)
     txt_path.write_text(final_summary, encoding="utf-8")

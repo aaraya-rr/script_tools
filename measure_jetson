@@ -13,12 +13,14 @@ Features:
   * Divider page
   * Per-core CPU results (util + freq) side-by-side
 - If GPU activity is 0%, a special GPU page is still added.
+
+New:
+- --quick: do not save CSV/PDF, only print summary to console.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import platform
 import re
 import statistics
@@ -112,7 +114,7 @@ CPU_RE = re.compile(r"CPU\s+\[([^\]]+)\]")
 GR3D_RE = re.compile(r"GR3D_FREQ\s+(\d+)%")
 
 
-def _append(metrics: Dict[str, MetricSeries], name: str, unit: str, value: float):
+def _append(metrics: Dict[str, MetricSeries], name: str, unit: str, value: float) -> None:
     if name not in metrics:
         metrics[name] = MetricSeries(name=name, unit=unit, values=[])
     metrics[name].values.append(value)
@@ -303,7 +305,6 @@ def generate_pdf(
     t0 = timestamps[0]
     time_s = [(ts - t0).total_seconds() for ts in timestamps]
 
-    # Metrics of interest (specific order)
     avg_order = [
         "cpu_avg_util_percent",
         "cpu_avg_freq_mhz",
@@ -312,7 +313,6 @@ def generate_pdf(
         "gpu_gr3d_freq_percent",
     ]
 
-    # Identify per-core metrics
     core_pairs: List[Tuple[MetricSeries, MetricSeries]] = []
     for series in metrics.values():
         if series.name.startswith("cpu_core_") and series.name.endswith("_util_percent"):
@@ -322,14 +322,11 @@ def generate_pdf(
             if freq_series:
                 core_pairs.append((util_series, freq_series))
 
-    # TOC entries built in order they will appear
-    toc_entries: List[Tuple[str, int]] = []
-    page_counter = 2  # Page 1 is system info + toc
+    page_counter = 2
 
     with PdfPages(pdf_path) as pdf:
 
-        # ---- PAGE 1: System info + TOC ----
-        fig = plt.figure(figsize=(11.69, 8.27))  # Landscape A4
+        fig = plt.figure(figsize=(11.69, 8.27))
         ax = fig.add_subplot(111)
         ax.axis("off")
 
@@ -352,13 +349,10 @@ def generate_pdf(
             "",
         ]
 
-        # Render system info + placeholder for TOC
         ax.text(0.02, 0.98, "\n".join(sys_lines), va="top", ha="left", fontsize=10)
 
-        # Now compute TOC entries
         toc_list = []
 
-        # First averages
         for name in avg_order:
             if name not in metrics:
                 continue
@@ -368,14 +362,12 @@ def generate_pdf(
 
         page_counter += 1
 
-        # Per-core pages
-        for util, freq in core_pairs:
+        for util, _freq in core_pairs:
             idx = util.name.split("_")[2]
             name = f"CPU Core {idx} (Util + Freq)"
             toc_list.append((name, page_counter))
             page_counter += 1
 
-        # Render TOC below system info
         y = 0.60
         for title, page in toc_list:
             line = f"{title} {'.' * (60 - len(title))} {page}"
@@ -385,7 +377,6 @@ def generate_pdf(
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- AVERAGE METRIC PAGES ----
         for name in avg_order:
             series = metrics.get(name)
             if not series:
@@ -395,7 +386,6 @@ def generate_pdf(
             ax = fig.add_subplot(111)
 
             if name == "gpu_gr3d_freq_percent" and max(series.values) == 0:
-                # Special GPU page: no activity
                 ax.axis("off")
                 ax.text(
                     0.5,
@@ -436,7 +426,6 @@ def generate_pdf(
             pdf.savefig(fig)
             plt.close(fig)
 
-        # ---- DIVIDER PAGE ----
         fig = plt.figure(figsize=(11.69, 8.27))
         ax = fig.add_subplot(111)
         ax.axis("off")
@@ -451,13 +440,11 @@ def generate_pdf(
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- PER-CORE PAGES ----
         for util_series, freq_series in core_pairs:
             fig = plt.figure(figsize=(11.69, 8.27))
             ax1 = fig.add_subplot(121)
             ax2 = fig.add_subplot(122)
 
-            # UTIL PLOT
             ax1.plot(time_s, util_series.values, linewidth=1.0)
             ax1.set_title(util_series.name)
             ax1.set_xlabel("Time [s]")
@@ -467,7 +454,12 @@ def generate_pdf(
             ax1.text(
                 0.98,
                 0.98,
-                f"min: {min(v):.3f}\nmean: {statistics.fmean(v):.3f}\nmedian: {statistics.median(v):.3f}\nmax: {max(v):.3f}",
+                (
+                    f"min: {min(v):.3f}\n"
+                    f"mean: {statistics.fmean(v):.3f}\n"
+                    f"median: {statistics.median(v):.3f}\n"
+                    f"max: {max(v):.3f}"
+                ),
                 transform=ax1.transAxes,
                 ha="right",
                 va="top",
@@ -475,7 +467,6 @@ def generate_pdf(
                 bbox=dict(boxstyle="round", alpha=0.2),
             )
 
-            # FREQ PLOT
             ax2.plot(time_s, freq_series.values, linewidth=1.0)
             ax2.set_title(freq_series.name)
             ax2.set_xlabel("Time [s]")
@@ -485,7 +476,12 @@ def generate_pdf(
             ax2.text(
                 0.98,
                 0.98,
-                f"min: {min(v):.3f}\nmean: {statistics.fmean(v):.3f}\nmedian: {statistics.median(v):.3f}\nmax: {max(v):.3f}",
+                (
+                    f"min: {min(v):.3f}\n"
+                    f"mean: {statistics.fmean(v):.3f}\n"
+                    f"median: {statistics.median(v):.3f}\n"
+                    f"max: {max(v):.3f}"
+                ),
                 transform=ax2.transAxes,
                 ha="right",
                 va="top",
@@ -498,9 +494,71 @@ def generate_pdf(
             plt.close(fig)
 
 
+# ---------------------------- Console reporting (quick mode) ----------------------------
+
+def _metric_summary_text(series: MetricSeries) -> str:
+    v = series.values
+    if not v:
+        return ""
+    return (
+        f"{series.name} ({series.unit}):\n"
+        f"  count: {len(v)}\n"
+        f"  min:   {min(v):.3f}\n"
+        f"  mean:  {statistics.fmean(v):.3f}\n"
+        f"  median:{statistics.median(v):.3f}\n"
+        f"  max:   {max(v):.3f}\n"
+    )
+
+
+def print_quick_report(metrics: Dict[str, MetricSeries]) -> None:
+    # Print key averages first (same idea as PDF order)
+    avg_order = [
+        "cpu_avg_util_percent",
+        "cpu_avg_freq_mhz",
+        "ram_used_percent",
+        "ram_used_mb",
+        "gpu_gr3d_freq_percent",
+    ]
+
+    printed = set()
+
+    print("\n=== QUICK REPORT (no files generated) ===\n")
+
+    for name in avg_order:
+        series = metrics.get(name)
+        if not series:
+            continue
+        print(_metric_summary_text(series))
+        printed.add(name)
+
+    # Then per-core in a stable order
+    def core_key(metric_name: str) -> Tuple[int, str]:
+        # cpu_core_{i}_util_percent / cpu_core_{i}_freq_mhz
+        m = re.match(r"cpu_core_(\d+)_(.+)", metric_name)
+        if not m:
+            return (10**9, metric_name)
+        return (int(m.group(1)), m.group(2))
+
+    core_names = sorted(
+        [n for n in metrics.keys() if n.startswith("cpu_core_")],
+        key=core_key,
+    )
+
+    for name in core_names:
+        if name in printed:
+            continue
+        print(_metric_summary_text(metrics[name]))
+        printed.add(name)
+
+    # Finally anything else (e.g., ram_total_mb)
+    remaining = sorted([n for n in metrics.keys() if n not in printed])
+    for name in remaining:
+        print(_metric_summary_text(metrics[name]))
+
+
 # ---------------------------- Helpers ----------------------------
 
-def remove_files(paths: List[Path]):
+def remove_files(paths: List[Path]) -> None:
     for p in paths:
         try:
             p.unlink()
@@ -518,6 +576,11 @@ def parse_args():
     p.add_argument("--interval-ms", type=int, default=1000)
     p.add_argument("--keep-intermediate", action="store_true")
     p.add_argument("--output-dir", default=".")
+    p.add_argument(
+        "--quick",
+        action="store_true",
+        help="Quick run: no CSV/PDF output. Prints metric summaries to console only.",
+    )
     return p.parse_args()
 
 
@@ -539,6 +602,15 @@ def main():
 
     print("Parsing log...")
     timestamps, metrics = parse_tegrastats_log(log_path)
+
+    if args.quick:
+        if not metrics:
+            print("No metrics parsed. The log may be empty or in an unexpected format.")
+        else:
+            print_quick_report(metrics)
+        # In quick mode, never keep anything
+        remove_files([log_path])
+        return
 
     print("Writing CSV files...")
     csv_paths = write_metric_csvs(base, timestamps, metrics, out)
