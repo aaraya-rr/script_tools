@@ -1,6 +1,8 @@
 import re
+import argparse
 from collections import defaultdict
 from statistics import mean
+from pathlib import Path
 
 
 class TegrastatsParser:
@@ -8,7 +10,6 @@ class TegrastatsParser:
         self.metrics = defaultdict(list)
 
     def parse_line(self, line: str) -> None:
-        """Parse a single tegrastats line."""
         if not line.strip():
             return
 
@@ -26,26 +27,21 @@ class TegrastatsParser:
     def _parse_ram(self, line: str) -> None:
         match = re.search(r"RAM (\d+)/(\d+)MB", line)
         if match:
-            used = int(match.group(1))
-            total = int(match.group(2))
-            self.metrics["RAM_used_MB"].append(used)
-            self.metrics["RAM_total_MB"].append(total)
+            self.metrics["RAM_used_MB"].append(int(match.group(1)))
+            self.metrics["RAM_total_MB"].append(int(match.group(2)))
 
     def _parse_swap(self, line: str) -> None:
         match = re.search(r"SWAP (\d+)/(\d+)MB", line)
         if match:
-            used = int(match.group(1))
-            total = int(match.group(2))
-            self.metrics["SWAP_used_MB"].append(used)
-            self.metrics["SWAP_total_MB"].append(total)
+            self.metrics["SWAP_used_MB"].append(int(match.group(1)))
+            self.metrics["SWAP_total_MB"].append(int(match.group(2)))
 
     def _parse_cpu(self, line: str) -> None:
         match = re.search(r"CPU \[(.*?)\]", line)
         if match:
-            cores = match.group(1).split(",")
             usages = []
 
-            for core in cores:
+            for core in match.group(1).split(","):
                 usage_match = re.search(r"(\d+)%@", core)
                 if usage_match:
                     usages.append(int(usage_match.group(1)))
@@ -55,21 +51,18 @@ class TegrastatsParser:
                 self.metrics["CPU_max_core_percent"].append(max(usages))
 
     def _parse_freq(self, line: str) -> None:
-        # EMC
         match = re.search(r"EMC_FREQ (\d+)%@?(\d+)?", line)
         if match:
             self.metrics["EMC_usage_percent"].append(int(match.group(1)))
             if match.group(2):
                 self.metrics["EMC_freq_MHz"].append(int(match.group(2)))
 
-        # GR3D
         match = re.search(r"GR3D_FREQ (\d+)%@?(\d+)?", line)
         if match:
             self.metrics["GR3D_usage_percent"].append(int(match.group(1)))
             if match.group(2):
                 self.metrics["GR3D_freq_MHz"].append(int(match.group(2)))
 
-        # VIC
         match = re.search(r"VIC_FREQ (\d+)%@(\d+)", line)
         if match:
             self.metrics["VIC_usage_percent"].append(int(match.group(1)))
@@ -78,11 +71,9 @@ class TegrastatsParser:
     def _parse_temperatures(self, line: str) -> None:
         matches = re.findall(r"(\w+)@([\d\.]+)C", line)
         for name, value in matches:
-            key = f"TEMP_{name}_C"
-            self.metrics[key].append(float(value))
+            self.metrics[f"TEMP_{name}_C"].append(float(value))
 
     def _parse_power(self, line: str) -> None:
-        # Example: VDD_IN 7867/7656
         matches = re.findall(r"(VDD_\w+)\s+(\d+)/(\d+)", line)
         for rail, current, avg in matches:
             self.metrics[f"{rail}_current_mW"].append(int(current))
@@ -109,24 +100,51 @@ class TegrastatsParser:
 
 
 # -------------------------
-# Usage example
+# CLI
 # -------------------------
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compute stats from tegrastats log file"
+    )
+    parser.add_argument(
+        "logfile",
+        type=Path,
+        help="Path to tegrastats log file"
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    if not args.logfile.exists():
+        raise FileNotFoundError(f"File not found: {args.logfile}")
+
     parser = TegrastatsParser()
 
-    # Read from file or stdin
-    # Example: cat log.txt | python script.py
-    import sys
-
-    for line in sys.stdin:
-        parser.parse_line(line)
+    with args.logfile.open("r", encoding="utf-8") as f:
+        for line in f:
+            parser.parse_line(line)
 
     stats = parser.compute_stats()
 
-    for metric, values in sorted(stats.items()):
-        print(f"{metric}: min={values['min']:.2f}, max={values['max']:.2f}, avg={values['avg']:.2f}")
+    if not stats:
+        print("No metrics found.")
+        return
 
+    # Compute padding dynamically
+    max_key_length = max(len(metric) for metric in stats.keys())
+
+    for metric, values in sorted(stats.items()):
+        padded_key = f"{metric}:".ljust(max_key_length + 2)
+
+        print(
+            f"{padded_key}\t"
+            f"min={values['min']:.2f},\t"
+            f"max={values['max']:.2f},\t"
+            f"avg={values['avg']:.2f}"
+        )
 
 if __name__ == "__main__":
     main()
